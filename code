@@ -1,0 +1,183 @@
+!pip install -q pymupdf sentence-transformers faiss-cpu groq gradio
+
+import os, io, json, time, shutil, getpass, base64, subprocess
+import numpy as np, faiss, fitz, groq
+import gradio as gr
+from pathlib import Path
+from google.colab import files
+from sentence_transformers import SentenceTransformer
+
+# ================= Config =================
+CHUNK_SIZE, CHUNK_OVERLAP, TOP_K = 700, 100, 5
+EMBED_MODEL = "all-MiniLM-L6-v2"
+TEXT_PREFS = ["llama-3.3-70b-versatile", "llama-3.1-70b-versatile", "llama-3.1-8b-instant"]
+VISION_PREFS = ["meta-llama/llama-4-scout-17b-16e-instruct",
+                "meta-llama/llama-4-maverick-17b-128e-instruct",
+                "llama-3.2-90b-vision-preview", "llama-3.2-11b-vision-preview"]
+
+# ================= 1. API key (validated before anything else) =================
+def init_client():
+    key = None
+    try:
+        from google.colab import userdata
+        key = userdata.get("GROQ_API_KEY")
+    except Exception:
+        key = None  # secret missing or notebook access off -> ask below
+
+    for attempt in range(3):
+        if not key or not key.strip().startswith("gsk_"):
+            key = getpass.getpass("Paste your Groq API key (starts with gsk_): ")
+        key = key.strip()
+        c = groq.Groq(api_key=key)
+        try:
+            available = [m.id for m in c.models.list().data]
+            return c, available
+        except groq.AuthenticationError:
+            print("Key rejected (401). Create a new key at console.groq.com > API Keys and try again.")
+            key = None
+    raise RuntimeError("Could not get a working Groq API key after 3 tries.")
+
+client, available = init_client()
+
+BAD = ("whisper", "guard", "tts", "orpheus", "playai", "safeguard")
+text_model = next((m for m in TEXT_PREFS if m in available), None) or \
+             next((m for m in available if not any(b in m.lower() for b in BAD)), None)
+vision_model = next((m for m in VISION_PREFS if m in available), None) or \
+               next((m for m in available if any(v in m.lower() for v in ("scout", "maverick", "vision"))), None)
+if not text_model:
+    raise RuntimeError("No usable chat model found on this Groq account.")
+print(f"Key works. Text model: {text_model} | Vision (OCR) model: {vision_model or 'none, will use Tesseract'}")
+
+def llm(model, messages, max_tokens=800):
+    """Chat call with automatic retry when the free-tier rate limit is hit."""
+    for attempt in range(5):
+        try:
+            r = client.chat.completions.create(model=model, messages=messages,
+                                               max_tokens=max_tokens, temperature=0)
+            return r.choices[0].message.content
+        except groq.RateLimitError:
+            wait = 8 * (attempt + 1)
+            print(f"    Rate limit hit, waiting {wait}s...")
+            time.sleep(wait)
+    raise RuntimeError("Still rate-limited after retries. Wait a minute and try again.")
+
+# ================= 2. OCR helpers (for scanned PDFs) =================
+_tess_ready = False
+def ocr_tesseract(img_bytes):
+    global _tess_ready
+    if not _tess_ready:
+        subprocess.run("apt-get -qq install -y tesseract-ocr > /dev/null 2>&1", shell=True)
+        subprocess.run("pip install -q pytesseract pillow", shell=True)
+        _tess_ready = True
+    import pytesseract
+    from PIL import Image
+    return pytesseract.image_to_string(Image.open(io.BytesIO(img_bytes)))
+
+def ocr_page(page):
+    img = page.get_pixmap(dpi=110).tobytes("jpeg")   # JPEG keeps the image small enough for the API
+    if vision_model:
+        try:
+            b64 = base64.b64encode(img).decode()
+            return llm(vision_model, [{"role": "user", "content": [
+                {"type": "text", "text": "Transcribe all text on this page exactly as written. "
+                                         "Write equations in plain text. Briefly describe any diagram in [brackets]. "
+                                         "Output only the transcription, nothing else."},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64}"}},
+            ]}], max_tokens=2000)
+        except Exception as e:
+            print(f"    Vision OCR failed ({type(e).__name__}), using Tesseract instead")
+    return ocr_tesseract(img)
+
+# ================= 3. Upload PDFs =================
+os.makedirs("docs", exist_ok=True)
+print("\nSelect your PDF files (cancel the picker to reuse PDFs already in docs/)...")
+uploaded = files.upload()
+print("Received:", list(uploaded.keys()) or "nothing new")
+for name in uploaded:
+    shutil.move(name, f"docs/{name}")
+
+pdf_files = sorted(p for p in Path("docs").iterdir() if p.suffix.lower() == ".pdf")
+if not pdf_files:
+    raise RuntimeError("No PDF files found. Re-run this cell and choose your PDFs in the picker.")
+print(f"Found {len(pdf_files)} PDF file(s) in docs/")
+
+# ================= 4. Extract text (text layer first, OCR fallback, cached) =================
+CACHE = Path("ocr_cache.json")
+cache = json.loads(CACHE.read_text()) if CACHE.exists() else {}
+
+pages = []
+for pdf in pdf_files:
+    with fitz.open(pdf) as doc:
+        n_text = n_ocr = 0
+        for n, page in enumerate(doc, start=1):
+            text = page.get_text().strip()
+            if text:
+                n_text += 1
+            else:
+                key = f"{pdf.name}|{pdf.stat().st_size}|{n}"
+                if key not in cache:
+                    print(f"  OCR {pdf.name} page {n}/{len(doc)}...")
+                    cache[key] = ocr_page(page).strip()
+                    CACHE.write_text(json.dumps(cache))
+                text = cache[key]
+                n_ocr += bool(text)
+            if text:
+                pages.append({"source": pdf.name, "page": n, "text": text})
+    print(f"  {pdf.name}: {n_text} pages with text layer, {n_ocr} pages read via OCR")
+
+if not pages:
+    raise RuntimeError("No text could be extracted from any PDF (blank or unreadable pages).")
+
+# ================= 5. Chunk =================
+chunks, step = [], CHUNK_SIZE - CHUNK_OVERLAP
+for p in pages:
+    text = " ".join(p["text"].split())
+    for start in range(0, len(text), step):
+        piece = text[start:start + CHUNK_SIZE]
+        if len(piece) >= 50:
+            chunks.append({"source": p["source"], "page": p["page"], "text": piece})
+if not chunks:
+    raise RuntimeError("Text was extracted but it is too short to chunk. Try a longer document.")
+print(f"\nLoaded {len(pages)} pages -> {len(chunks)} chunks")
+
+# ================= 6. Embed + index =================
+embedder = SentenceTransformer(EMBED_MODEL)
+emb = embedder.encode([c["text"] for c in chunks], batch_size=64,
+                      show_progress_bar=True, normalize_embeddings=True)
+emb = np.asarray(emb, dtype="float32")
+index = faiss.IndexFlatIP(emb.shape[1])
+index.add(emb)
+
+# ================= 7. Retrieve + generate =================
+def retrieve(question, k=TOP_K):
+    q = embedder.encode([question], normalize_embeddings=True)
+    scores, ids = index.search(np.asarray(q, dtype="float32"), k)
+    return [{**chunks[i], "score": float(s)} for s, i in zip(scores[0], ids[0]) if i != -1]
+
+SYSTEM_PROMPT = (
+    "You answer questions using ONLY the provided context excerpts. "
+    "Cite sources inline like [file.pdf, p.3]. "
+    "If the answer is not in the context, say \"I don't know based on the "
+    "provided documents.\" Do not use outside knowledge."
+)
+
+def generate_answer(question, hits):
+    context = "\n\n".join(f"[{h['source']}, p.{h['page']}]\n{h['text']}" for h in hits)
+    return llm(text_model, [
+        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "user", "content": f"Context:\n{context}\n\nQuestion: {question}"},
+    ])
+
+# ================= 8. Chat UI =================
+def chat(message, history):
+    if not message or not message.strip():
+        return "Please type a question."
+    try:
+        hits = retrieve(message)
+        answer = generate_answer(message, hits)
+        sources = "\n".join(f"- {h['source']}, p.{h['page']} (score {h['score']:.2f})" for h in hits)
+        return f"{answer}\n\n**Sources**\n{sources}"
+    except Exception as e:
+        return f"Something went wrong: {type(e).__name__}: {e}"
+
+gr.ChatInterface(chat, title="DocuChat", description="Ask questions about your PDFs").launch(share=True, debug=True)
